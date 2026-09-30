@@ -1,4 +1,4 @@
-# mrdvs_wrapper
+# lx_camera_ros
 
 The main launch file follows the arguments used in `rs_camera.launch.py`:
 
