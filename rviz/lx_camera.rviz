@@ -51,22 +51,12 @@ Visualization Manager:
       Frame Timeout: 15
       Frames:
         All Enabled: true
-        base_link:
-          Value: true
-        mrdvs_rgb:
-          Value: true
-        mrdvs_tof:
-          Value: true
       Marker Scale: 1
       Name: TF
       Show Arrows: true
       Show Axes: true
       Show Names: false
-      Tree:
-        base_link:
-          mrdvs_tof:
-            mrdvs_rgb:
-              {}
+      Tree: {}
       Update Interval: 0
       Value: true
     - Class: rviz_default_plugins/Image
@@ -148,7 +138,7 @@ Visualization Manager:
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
-    Fixed Frame: base_link
+    Fixed Frame: uav1/rgbd/link
     Frame Rate: 30
   Name: root
   Tools:

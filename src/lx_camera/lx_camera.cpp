@@ -1,4 +1,4 @@
-﻿#include "lx_camera/lx_camera.h"
+#include "lx_camera/lx_camera.h"
 #include "lx_camera.h"
 #include "rclcpp/callback_group.hpp"
 #include "sensor_msgs/msg/point_cloud.hpp"
@@ -14,7 +14,7 @@
 #include <array>
 
 static DcLib *LX_DYNAMIC_LIB = nullptr;
-rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr kPubImu = nullptr;
+
 
 
 #define SET_INT_PARAM(cmd){                             \
@@ -31,27 +31,6 @@ Check(#cmd, DcSetBoolValue(handle_, cmd, value));       \
 
 
 
-geometry_msgs::msg::TransformStamped PoseToTf(const Eigen::Matrix4f &pose) {
-  geometry_msgs::msg::TransformStamped transform_stamped;
-  transform_stamped.transform.translation.x = pose(0, 3);
-  transform_stamped.transform.translation.y = pose(1, 3);
-  transform_stamped.transform.translation.z = pose(2, 3);
-  Eigen::Matrix3f rotation_matrix = pose.topLeftCorner(3, 3);
-  Eigen::Quaternionf quat(rotation_matrix);
-  transform_stamped.transform.rotation.x = quat.x();
-  transform_stamped.transform.rotation.y = quat.y();
-  transform_stamped.transform.rotation.z = quat.z();
-  transform_stamped.transform.rotation.w = quat.w();
-  return transform_stamped;
-}
-
-static long GetTimestamp() {
-  struct timeval tv;
-  gettimeofday(&tv, NULL);
-  long t = tv.tv_sec * 1000L + tv.tv_usec / 1000L;
-  return t;
-}
-
 struct CameraCalibMatrices {
   std::array<double, 9> K{};
   std::array<double, 14> D{};
@@ -63,7 +42,8 @@ static bool GetCameraCalibration(DcHandle handle, int type,
     LxIntrinsicParameters* calib = nullptr;
     if (LX_SUCCESS != DcGetPtrValue(handle,
         0 == type ? LX_PTR_2D_INTRINSIC_PARAMETERS : LX_PTR_3D_INTRINSIC_PARAMETERS,
-        (void**)&calib))
+        (void**)&calib) || !calib || calib->num_distortion_coeffs > out.D.size() ||
+        (calib->num_distortion_coeffs && !calib->distortion_coeffs))
         return false;
 
     for (size_t i = 0; i < 9; ++i) {
@@ -77,9 +57,12 @@ static bool GetCameraCalibration(DcHandle handle, int type,
     return true;
 }
 
-void ImuDataCallback(LxImuData *data_ptr, void *usr_data) {
+void LxCamera::ImuDataCallback(LxImuData *data_ptr, void *usr_data) {
+  if (!data_ptr || !usr_data) return;
+  auto *camera = static_cast<LxCamera *>(usr_data);
   sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu);
-  msg->header.frame_id = "mrdvs_imu";
+  msg->header.frame_id = camera->frames_->imu;
+  msg->orientation_covariance[0] = -1.0;
   int64_t nanoseconds = static_cast<int64_t>(data_ptr->imu_data.sensor_timestamp * 1e3);
   msg->header.stamp.sec = nanoseconds / 1e9;
   msg->header.stamp.nanosec = nanoseconds % static_cast<int64_t>(1e9);
@@ -89,20 +72,22 @@ void ImuDataCallback(LxImuData *data_ptr, void *usr_data) {
   msg->angular_velocity.x = data_ptr->imu_data.gry_x;
   msg->angular_velocity.y = data_ptr->imu_data.gry_y;
   msg->angular_velocity.z = data_ptr->imu_data.gry_z;
-  kPubImu->publish(*msg);
+  camera->pub_imu_->publish(*msg);
 }
 
-LxCamera::LxCamera(DcLib *dynamic_lib) : Node("lx_camera_node") {
+LxCamera::LxCamera(DcLib *dynamic_lib, const rclcpp::NodeOptions &options)
+    : Node("lx_camera_node", options) {
   RCLCPP_INFO(this->get_logger(), "lx_camera_node start!");
   LX_DYNAMIC_LIB = dynamic_lib;
   qos_ = rmw_qos_profile_default;
-  //ReadParam();
+  ConfigureFrames();
 
   auto default_qos = rclcpp::QoS(rclcpp::SystemDefaultsQoS());
   pub_rgb_ = this->create_publisher<sensor_msgs::msg::Image>("LxCamera_Rgb", 1);
   pub_rgb_info_ = this->create_publisher<sensor_msgs::msg::CameraInfo>(
       "LxCamera_RgbInfo", 1);
   pub_amp_ = this->create_publisher<sensor_msgs::msg::Image>("LxCamera_Amp", 1);
+  pub_amp_info_ = this->create_publisher<sensor_msgs::msg::CameraInfo>("LxCamera_AmpInfo", 1);
   pub_depth_ =
       this->create_publisher<sensor_msgs::msg::Image>("LxCamera_Depth", 1);
   pub_tof_info_ = this->create_publisher<sensor_msgs::msg::CameraInfo>(
@@ -116,14 +101,12 @@ LxCamera::LxCamera(DcLib *dynamic_lib) : Node("lx_camera_node") {
       "LxCamera_FrameRate", 1);
   pub_obstacle_ = this->create_publisher<lx_camera_ros::msg::Obstacle>(
       "LxCamera_Obstacle", 1);
-  kPubImu = this->create_publisher<sensor_msgs::msg::Imu>("LxCamera_Imu", 20);
+  pub_imu_ = this->create_publisher<sensor_msgs::msg::Imu>("LxCamera_Imu", 20);
   pub_cloud_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
       "LxCamera_Cloud", 10);
   //pub_lidarCloud_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
   //  "LxCamera_LidarCloud", 10);
 
-  pub_tf_ = this->create_publisher<geometry_msgs::msg::TransformStamped>(
-      "LxCamera_TF", 1);
 
   auto cmd = this->create_service<lx_camera_ros::srv::LxCmd>(
       "LxCamera_LxCmd", std::bind(&LxCamera::LxCmd, this, std::placeholders::_1,
@@ -143,6 +126,8 @@ LxCamera::LxCamera(DcLib *dynamic_lib) : Node("lx_camera_node") {
       "LxCamera_LxString",
       std::bind(&LxCamera::LxString, this, std::placeholders::_1,
                 std::placeholders::_2));
+
+  services_ = {cmd, lxi, lxb, lxf, lxs};
 
   // set sdk log
   RCLCPP_INFO(this->get_logger(), "Api version: %s", DcGetApiVersion());
@@ -235,138 +220,112 @@ LxCamera::LxCamera(DcLib *dynamic_lib) : Node("lx_camera_node") {
     Start();
   }
 
-  Run();
 }
 
 LxCamera::~LxCamera() {
-  DcStopStream(handle_);
-  DcCloseDevice(handle_);
+  if (device_open_) {
+    DcUnregisterImuDataCallback(handle_);
+    DcStopStream(handle_);
+    DcCloseDevice(handle_);
+  }
+}
+
+static void SetCameraCalibration(sensor_msgs::msg::CameraInfo &info,
+                                 const CameraCalibMatrices &calib) {
+  info.k = calib.K;
+  info.r = {1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0};
+  info.p = {calib.K[0], calib.K[1], calib.K[2], 0.0,
+            calib.K[3], calib.K[4], calib.K[5], 0.0,
+            calib.K[6], calib.K[7], calib.K[8], 0.0};
+  // Keep the SDK model identifier until its coefficients can be mapped exactly.
+  switch (calib.distortion_model) {
+    case LX_DISTORTION_RADTAN_5:
+      info.distortion_model = "plumb_bob";
+      info.d.assign(calib.D.begin(), calib.D.begin() + 5);
+      break;
+    case LX_DISTORTION_FISHEYE:
+      info.distortion_model = "equidistant";
+      info.d.assign(calib.D.begin(), calib.D.begin() + 4);
+      break;
+    case LX_DISTORTION_RADTAN_14:
+      info.distortion_model = "LX_DISTORTION_RADTAN_14";
+      info.d.assign(calib.D.begin(), calib.D.end());
+      break;
+    case LX_DISTORTION_SCARAMUZZA:
+      info.distortion_model = "LX_DISTORTION_SCARAMUZZA";
+      info.d.assign(calib.D.begin(), calib.D.end());
+      break;
+    default:
+      info.distortion_model = "LX_DISTORTION_UNDEFINE";
+      info.d.clear();
+  }
 }
 
 int LxCamera::Start() {
-  LxIntValueInfo int_value;
-  DcGetIntValue(handle_, LX_INT_3D_IMAGE_WIDTH, &int_value);
-  tof_info_.width = int_value.cur_value;
-  DcGetIntValue(handle_, LX_INT_3D_IMAGE_HEIGHT, &int_value);
-  tof_info_.height = int_value.cur_value;
-  DcGetIntValue(handle_, LX_INT_3D_IMAGE_OFFSET_X, &int_value);
-  tof_info_.roi.x_offset = int_value.cur_value;
-  DcGetIntValue(handle_, LX_INT_3D_IMAGE_OFFSET_Y, &int_value);
-  tof_info_.roi.y_offset = int_value.cur_value;
-  DcGetIntValue(handle_, LX_INT_3D_BINNING_MODE, &int_value);
-  tof_info_.binning_x = int_value.cur_value * 2;
-  tof_info_.binning_y = tof_info_.binning_x;
+  if (is_start_) return LX_SUCCESS;
+  auto read_int = [this](int feature, int &value) {
+    LxIntValueInfo info{};
+    const auto result = DcGetIntValue(handle_, feature, &info);
+    if (result != LX_SUCCESS) return false;
+    value = info.cur_value;
+    return true;
+  };
+  bool enabled = false;
+  if (DcGetBoolValue(handle_, LX_BOOL_ENABLE_3D_DEPTH_STREAM, &enabled) == LX_SUCCESS)
+    is_depth_ = enabled;
+  if (DcGetBoolValue(handle_, LX_BOOL_ENABLE_3D_AMP_STREAM, &enabled) == LX_SUCCESS)
+    is_amp_ = enabled;
+  if (DcGetBoolValue(handle_, LX_BOOL_ENABLE_2D_STREAM, &enabled) == LX_SUCCESS)
+    is_rgb_ = enabled;
+  read_int(LX_INT_ALGORITHM_MODE, inside_app_);
 
-  DcGetIntValue(handle_, LX_INT_2D_IMAGE_WIDTH, &int_value);
-  rgb_info_.width = int_value.cur_value;
-  DcGetIntValue(handle_, LX_INT_2D_IMAGE_HEIGHT, &int_value);
-  rgb_info_.height = int_value.cur_value;
-  DcGetIntValue(handle_, LX_INT_2D_IMAGE_OFFSET_X, &int_value);
-  rgb_info_.roi.x_offset = int_value.cur_value;
-  DcGetIntValue(handle_, LX_INT_2D_IMAGE_OFFSET_Y, &int_value);
-  rgb_info_.roi.y_offset = int_value.cur_value;
-  DcGetIntValue(handle_, LX_INT_2D_BINNING_MODE, &int_value);
-  rgb_info_.binning_x = int_value.cur_value * 2;
-  rgb_info_.binning_y = rgb_info_.binning_x;
-  DcGetIntValue(handle_, LX_INT_2D_IMAGE_DATA_TYPE, &int_value);
-  rgb_type_ = int_value.cur_value;
-  DcGetIntValue(handle_, LX_INT_2D_IMAGE_CHANNEL, &int_value);
-  rgb_channel_ = int_value.cur_value;
-
-
-  DcGetBoolValue(handle_, LX_BOOL_ENABLE_3D_DEPTH_STREAM, (bool *)&is_depth_);
-  DcGetBoolValue(handle_, LX_BOOL_ENABLE_3D_AMP_STREAM, (bool *)&is_amp_);
-  DcGetBoolValue(handle_, LX_BOOL_ENABLE_2D_STREAM, (bool *)&is_rgb_);
-  DcGetIntValue(handle_, LX_INT_ALGORITHM_MODE, &int_value);
-  inside_app_ = int_value.cur_value;
-
-  DcGetIntValue(handle_, LX_INT_RGBD_ALIGN_MODE, &int_value);
-  lx_rgbd_align = int_value.cur_value;
-
-  // get image params
-  if (is_depth_ || is_amp_ || is_xyz_) {
-    CameraCalibMatrices tof_calib;
-    if (GetCameraCalibration(handle_, 1, tof_calib)) {
-        switch (tof_calib.distortion_model) {
-        case LX_DISTORTION_RADTAN_5:
-            tof_info_.distortion_model = "LX_DISTORTION_RADTAN_5";
-            break;
-        case LX_DISTORTION_RADTAN_14:
-            tof_info_.distortion_model = "LX_DISTORTION_RADTAN_14";
-            break;
-        case LX_DISTORTION_FISHEYE:
-            tof_info_.distortion_model = "LX_DISTORTION_FISHEYE";
-            break;
-        case LX_DISTORTION_SCARAMUZZA:
-            tof_info_.distortion_model = "LX_DISTORTION_SCARAMUZZA";
-            break;
-        default:
-            tof_info_.distortion_model = "LX_DISTORTION_UNDEFINE";
-            break;
-        }
-      tof_info_.k = tof_calib.K;
-      tof_info_.d.assign(tof_calib.D.begin(), tof_calib.D.end());
-    } else {
-      tof_info_.k.fill(0.0);
-      tof_info_.d.clear();
+  // Use the effective device settings, including values retained in firmware.
+  if (!read_int(LX_INT_RGBD_ALIGN_MODE, lx_rgbd_align) ||
+      lx_rgbd_align < 0 || lx_rgbd_align > 3) {
+    RCLCPP_ERROR(get_logger(), "Cannot determine RGB-D alignment; refusing ambiguous frame IDs");
+    return LX_ERROR;
+  }
+  depth_image_frame_ = frames_->DepthImage(lx_rgbd_align);
+  color_image_frame_ = frames_->ColorImage(lx_rgbd_align);
+  if (is_xyz_) {
+    int coordinate = -1, unit = -1;
+    if (!read_int(LX_INT_XYZ_COORDINATE, coordinate) ||
+        !read_int(LX_INT_XYZ_UNIT, unit) ||
+        (coordinate != 0 && coordinate != 1) || (unit != 0 && unit != 1)) {
+      RCLCPP_ERROR(get_logger(), "Cannot determine point cloud axes/units; refusing ambiguous geometry");
+      return LX_ERROR;
     }
-
-    float *ex_intr = nullptr;
-    if (DcGetPtrValue(handle_, LX_PTR_3D_EXTRIC_PARAM,
-                      (void **)&ex_intr) == LX_SUCCESS && ex_intr) {
-      for (int i = 0; i < 9; i++) {
-        tof_info_.r[i] = ex_intr[i];
-      }
-      for (int i = 9; i < 12; i++)
-      {
-        tof_info_.p[i] = ex_intr[i];
-      }
-    }
-
-    auto q = ToQuaternion(install_yaw_, install_pitch_, install_roll_);
-    tf_.transform.translation.x = install_x_;
-    tf_.transform.translation.y = install_y_;
-    tf_.transform.translation.z = install_z_;
-    tf_.transform.rotation.x = q.x;
-    tf_.transform.rotation.y = q.y;
-    tf_.transform.rotation.z = q.z;
-    tf_.transform.rotation.w = q.w;
-    tof_info_.header.frame_id = "intrinsic_tof";
-    tf_.header.frame_id = "intrinsic_tof";
-    tf_.child_frame_id = "mrdvs";
+    cloud_frame_ = frames_->Cloud(lx_rgbd_align, coordinate);
+    cloud_unit_scale_ = unit == 0 ? 0.001 : 1.0;
   }
 
+  auto read_camera_info = [&](bool color, sensor_msgs::msg::CameraInfo &info) {
+    info = sensor_msgs::msg::CameraInfo();
+    int width = 0, height = 0;
+    read_int(color ? LX_INT_2D_IMAGE_WIDTH : LX_INT_3D_IMAGE_WIDTH, width);
+    read_int(color ? LX_INT_2D_IMAGE_HEIGHT : LX_INT_3D_IMAGE_HEIGHT, height);
+    info.width = width;
+    info.height = height;
+    // The SDK provides intrinsics for the configured output resolution.
+    // Do not apply ROI/binning a second time in ROS consumers.
+    CameraCalibMatrices calib;
+    const bool target_color = color ? lx_rgbd_align != 2
+                                   : (lx_rgbd_align == 1 || lx_rgbd_align == 3);
+    if (GetCameraCalibration(handle_, target_color ? 0 : 1, calib)) {
+      SetCameraCalibration(info, calib);
+    } else {
+      RCLCPP_WARN(get_logger(), "Missing camera intrinsics; publishing uncalibrated CameraInfo");
+    }
+    info.header.frame_id = color ? color_image_frame_ : depth_image_frame_;
+  };
+  if (is_depth_ || is_amp_ || is_xyz_) read_camera_info(false, tof_info_);
   if (is_rgb_) {
-    CameraCalibMatrices rgb_calib;
-    if (GetCameraCalibration(handle_, 0, rgb_calib)) {
-        switch (rgb_calib.distortion_model) {
-        case LX_DISTORTION_RADTAN_5:
-            rgb_info_.distortion_model = "LX_DISTORTION_RADTAN_5";
-            break;
-        case LX_DISTORTION_RADTAN_14:
-            rgb_info_.distortion_model = "LX_DISTORTION_RADTAN_14";
-            break;
-        case LX_DISTORTION_FISHEYE:
-            rgb_info_.distortion_model = "LX_DISTORTION_FISHEYE";
-            break;
-        case LX_DISTORTION_SCARAMUZZA:
-            rgb_info_.distortion_model = "LX_DISTORTION_SCARAMUZZA";
-            break;
-        default:
-            rgb_info_.distortion_model = "LX_DISTORTION_UNDEFINE";
-            break;
-        }
-
-      rgb_info_.k = rgb_calib.K;
-      rgb_info_.d.assign(rgb_calib.D.begin(), rgb_calib.D.end());
-    } else {
-      rgb_info_.k.fill(0.0);
-      rgb_info_.d.clear();
-    }
-
-    rgb_info_.header.frame_id = "intrinsic_rgb";
+    read_camera_info(true, rgb_info_);
+    read_int(LX_INT_2D_IMAGE_DATA_TYPE, rgb_type_);
+    read_int(LX_INT_2D_IMAGE_CHANNEL, rgb_channel_);
   }
-  auto ret = DcStartStream(handle_);
+  PublishStaticTransforms();
+  const auto ret = DcStartStream(handle_);
   is_start_ = (ret == LX_SUCCESS);
   return static_cast<int>(ret);
 }
@@ -380,48 +339,35 @@ int LxCamera::Stop() {
 }
 
 void LxCamera::Run() {
-  Eigen::Matrix3f R = (Eigen::AngleAxisf(install_yaw_ / 180.f * M_PI,
-                                         Eigen::Vector3f::UnitZ()) *
-                       Eigen::AngleAxisf(install_pitch_ / 180.f * M_PI,
-                                         Eigen::Vector3f::UnitY()) *
-                       Eigen::AngleAxisf(install_roll_ / 180.f * M_PI,
-                                         Eigen::Vector3f::UnitX()))
-                          .toRotationMatrix();
-  Eigen::Vector3f t{install_x_, install_y_, install_z_};
-  Eigen::Matrix4f ext_base_tof = Eigen::Matrix4f::Identity();
-  ext_base_tof.block(0, 0, 3, 3) = R;
-  ext_base_tof.block(0, 3, 3, 1) = t;
-  geometry_msgs::msg::TransformStamped tf_ext_base_tof = PoseToTf(ext_base_tof);
-
-  Eigen::Matrix4f ext_tof_rgb = Eigen::Matrix4f::Identity();
-  geometry_msgs::msg::TransformStamped tf_ext_tof_rgb;
-  if ((is_xyz_ || is_depth_ || is_amp_) && is_rgb_) {
-    Eigen::Matrix4f ext_rgb_tof = Eigen::Matrix4f::Identity();
-    float *ext_param = nullptr;
-    DcGetPtrValue(handle_, LX_PTR_3D_EXTRIC_PARAM, (void **)&ext_param);
-    ext_rgb_tof << ext_param[0], ext_param[1], ext_param[2],
-        ext_param[9] * 0.001, ext_param[3], ext_param[4], ext_param[5],
-        ext_param[10] * 0.001, ext_param[6], ext_param[7], ext_param[8],
-        ext_param[11] * 0.001, 0, 0, 0, 1;
-    ext_tof_rgb = ext_rgb_tof.inverse();
-    tf_ext_tof_rgb = PoseToTf(ext_tof_rgb);
-    RCLCPP_INFO_STREAM(this->get_logger(), "ext_rgb_tof:" << ext_rgb_tof);
+  if (!is_start_) {
+    RCLCPP_ERROR(get_logger(), "Camera stream did not start");
+    return;
   }
   long frame_count=0;
   rclcpp::Rate rate(20);
-  rclcpp::Node::SharedPtr node(this);
+  auto node = shared_from_this();
   while (rclcpp::ok()) {
+    if (!is_start_) {
+      rclcpp::spin_some(node);
+      rate.sleep();
+      continue;
+    }
     FrameInfo *one_frame = nullptr;
     auto sret = DcSetCmd(handle_, LX_CMD_GET_NEW_FRAME);
     if ((LX_SUCCESS != sret) && (LX_E_FRAME_ID_NOT_MATCH != sret) &&
         (LX_E_FRAME_MULTI_MACHINE != sret)) {
-      Check("LX_CMD_GET_NEW_FRAME",sret);    
+      Check("LX_CMD_GET_NEW_FRAME",sret);
+      rclcpp::spin_some(node);
+      rate.sleep();
       continue;
     }
     if (Check("LX_PTR_FRAME_DATA",
               DcGetPtrValue(handle_, LX_PTR_FRAME_DATA, (void **)&one_frame))) {
+      rclcpp::spin_some(node);
+      rate.sleep();
       continue;
     }
+    if (!one_frame) continue;
     rclcpp::Time now = this->get_clock()->now();
     float dep_fps = 0.0, amp_fps = 0.0, rgb_fps = 0.0, temp = 0.0;
     LxFloatValueInfo f_val;
@@ -453,10 +399,14 @@ void LxCamera::Run() {
         cv_img.header.stamp.sec = nanoseconds / 1e9;
         cv_img.header.stamp.nanosec = nanoseconds % static_cast<int64_t>(1e9);
 
-        cv_img.header.frame_id = "mrdvs_tof";
+        cv_img.header.frame_id = depth_image_frame_;
         cv_img.encoding = "mono16";
         cv_img.toImageMsg(msg_depth);
         pub_depth_->publish(msg_depth);
+        tof_info_.header = msg_depth.header;
+        tof_info_.width = msg_depth.width;
+        tof_info_.height = msg_depth.height;
+        pub_tof_info_->publish(tof_info_);
 
         if(is_xyz_ == 2){
           void* xyzirt_data = nullptr;
@@ -471,9 +421,9 @@ void LxCamera::Run() {
               double lidar_timestamp =
                   static_cast<double>(data->timebase) + static_cast<double>(point.offset_time);
               lidarCloud->points.emplace_back(
-                  point.x,
-                  point.y,
-                  point.z,
+                  point.x * cloud_unit_scale_,
+                  point.y * cloud_unit_scale_,
+                  point.z * cloud_unit_scale_,
                   point.intensity,
                   lidar_timestamp,
                   point.row_pos,
@@ -487,7 +437,7 @@ void LxCamera::Run() {
             int64_t ns = static_cast<int64_t>(data->timebase) * 1000;
             msg_lidarCloud.header.stamp.sec = ns / 1000000000LL;
             msg_lidarCloud.header.stamp.nanosec = ns % 1000000000LL;
-            msg_lidarCloud.header.frame_id = "mrdvs_tof";
+            msg_lidarCloud.header.frame_id = cloud_frame_;
             pub_cloud_->publish(msg_lidarCloud);
           }
 
@@ -507,9 +457,9 @@ void LxCamera::Run() {
                     continue;
                 }
                 pcl::PointXYZRGB point;
-                point.x = xyz_data[index];
-                point.y = xyz_data[index + 1];
-                point.z = xyz_data[index + 2];
+                point.x = xyz_data[index] * cloud_unit_scale_;
+                point.y = xyz_data[index + 1] * cloud_unit_scale_;
+                point.z = xyz_data[index + 2] * cloud_unit_scale_;
 
                 if (!lx_rgbd_align || rgb_data == nullptr || rgb_channel_ != 3) {
                     point.b = 255;
@@ -533,7 +483,7 @@ void LxCamera::Run() {
 
             msg_cloud.header.stamp.nanosec =
                 nanoseconds % static_cast<int64_t>(1e9);
-            msg_cloud.header.frame_id = "mrdvs_tof";
+            msg_cloud.header.frame_id = cloud_frame_;
             pub_cloud_->publish(msg_cloud);
           }
 
@@ -566,10 +516,16 @@ void LxCamera::Run() {
             static_cast<int64_t>(one_frame->amp_data.sensor_timestamp * 1e3);
         cv_img.header.stamp.sec = nanoseconds / 1e9;
         cv_img.header.stamp.nanosec = nanoseconds % static_cast<int64_t>(1e9);
-        cv_img.header.frame_id = "mrdvs_tof";
+        cv_img.header.frame_id = depth_image_frame_;
         cv_img.image = amp_img;
         cv_img.toImageMsg(msg_amp);
         pub_amp_->publish(msg_amp);
+        auto amp_info = tof_info_;
+        amp_info.header = msg_amp.header;
+        amp_info.width = msg_amp.width;
+        amp_info.height = msg_amp.height;
+        pub_amp_info_->publish(amp_info);
+        if (!is_depth_ && !is_xyz_) pub_tof_info_->publish(amp_info);
       }
 
       Check("LX_FLOAT_3D_AMPLITUDE_FPS",
@@ -592,11 +548,15 @@ void LxCamera::Run() {
             static_cast<int64_t>(one_frame->rgb_data.sensor_timestamp * 1e3);
         cv_img.header.stamp.sec = nanoseconds / 1e9;
         cv_img.header.stamp.nanosec = nanoseconds % static_cast<int64_t>(1e9);
-        cv_img.header.frame_id = "mrdvs_rgb";
+        cv_img.header.frame_id = color_image_frame_;
         cv_img.encoding = rgb_type_;
         cv_img.image = rgb_pub;
         cv_img.toImageMsg(msg_rgb);
         pub_rgb_->publish(msg_rgb);
+        rgb_info_.header = msg_rgb.header;
+        rgb_info_.width = msg_rgb.width;
+        rgb_info_.height = msg_rgb.height;
+        pub_rgb_info_->publish(rgb_info_);
       }
 
       Check("LX_FLOAT_2D_IMAGE_FPS",
@@ -604,24 +564,11 @@ void LxCamera::Run() {
       rgb_fps = f_val.cur_value;
     }
 
-    if (is_amp_ || is_depth_ || is_xyz_) {
-      tof_info_.header.stamp = now;
-      pub_tof_info_->publish(tof_info_);
-    }
-    if (is_rgb_) {
-      rgb_info_.header.stamp = now;
-      pub_rgb_info_->publish(rgb_info_);
-    }
-    if (is_xyz_) {
-      tf_.header.stamp = now;
-      pub_tf_->publish(tf_);
-    }
-
     Check("LX_FLOAT_DEVICE_TEMPERATURE",
           DcGetFloatValue(handle_, LX_FLOAT_DEVICE_TEMPERATURE, &f_val));
     temp = f_val.cur_value;
     lx_camera_ros::msg::FrameRate fr;
-    fr.header.frame_id = "mrdvs";
+    fr.header.frame_id = frames_->link;
     fr.header.stamp = now;
     fr.amp = amp_fps;
     fr.rgb = rgb_fps;
@@ -629,24 +576,12 @@ void LxCamera::Run() {
     fr.temperature = temp;
     pub_temper_->publish(fr);
 
-    // pub TF
-    tf_ext_base_tof.header.stamp = now;
-    tf_ext_base_tof.header.frame_id = "base_link";
-    tf_ext_base_tof.child_frame_id = "mrdvs_tof";
-    PubTf(tf_ext_base_tof);
-    if ((is_xyz_ || is_depth_ || is_amp_) && is_rgb_) {
-      tf_ext_tof_rgb.header.stamp = now;
-      tf_ext_tof_rgb.header.frame_id = "mrdvs_tof";
-      tf_ext_tof_rgb.child_frame_id = "mrdvs_rgb";
-      PubTf(tf_ext_tof_rgb);
-    }
-
     int ret = 0;
     void *app_ptr = one_frame->app_data.frame_data;
     switch (inside_app_) {
     case MODE_AVOID_OBSTACLE: {
       lx_camera_ros::msg::Obstacle result;
-      result.header.frame_id = "mrdvs";
+      result.header.frame_id = frames_->prefix + "/application";
       int64_t nanoseconds =
           static_cast<int64_t>(one_frame->app_data.sensor_timestamp * 1e3);
       result.header.stamp.sec = nanoseconds / 1e9;
@@ -683,7 +618,7 @@ void LxCamera::Run() {
         break;
       }
       lx_camera_ros::msg::Pallet result;
-      result.header.frame_id = "mrdvs";
+      result.header.frame_id = frames_->prefix + "/application";
       int64_t nanoseconds =
           static_cast<int64_t>(one_frame->app_data.sensor_timestamp * 1e3);
       result.header.stamp.sec = nanoseconds / 1e9;
@@ -707,7 +642,7 @@ void LxCamera::Run() {
             static_cast<int64_t>(one_frame->app_data.sensor_timestamp * 1e3);
         alg_val.header.stamp.sec = nanoseconds / 1e9;
         alg_val.header.stamp.nanosec = nanoseconds % static_cast<int64_t>(1e9);
-        alg_val.header.frame_id = "mrdvs";
+        alg_val.header.frame_id = frames_->prefix + "/application";
         auto qua_res = ToQuaternion(val->theta, 0, 0);
         alg_val.pose.position.x = val->x;
         alg_val.pose.position.y = val->y;
@@ -722,7 +657,7 @@ void LxCamera::Run() {
     }
     case MODE_AVOID_OBSTACLE2: {
       lx_camera_ros::msg::Obstacle result;
-      result.header.frame_id = "mrdvs";
+      result.header.frame_id = frames_->prefix + "/application";
       int64_t nanoseconds =
           static_cast<int64_t>(one_frame->app_data.sensor_timestamp * 1e3);
       result.header.stamp.sec = nanoseconds / 1e9;
@@ -782,6 +717,7 @@ bool LxCamera::SearchAndOpenDevice() {
     RCLCPP_ERROR(this->get_logger(), "Open device failed!");
     return false;
   }
+  device_open_ = true;
   RCLCPP_INFO(this->get_logger(),
               "Open device success:"
               "\ndevice handle:             %lld"
@@ -998,9 +934,82 @@ bool LxCamera::LxInt(const lx_camera_ros::srv::LxInt::Request::SharedPtr req,
   return true;
 }
 
-void LxCamera::PubTf(
-    const geometry_msgs::msg::TransformStamped &transform_stamped) {
-  static std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster =
-      std::make_shared<tf2_ros::TransformBroadcaster>(this);
-  tf_broadcaster->sendTransform(transform_stamped);
+void LxCamera::ConfigureFrames() {
+  const auto base = declare_parameter<std::string>("base_frame_id", "link");
+  frames_.reset(new lx_camera::FrameNames(get_namespace(), get_name(), base));
+  publish_tf_ = declare_parameter<bool>("publish_tf", true);
+  publish_mount_tf_ = declare_parameter<bool>("publish_mount_tf", false);
+  const auto ns = lx_camera::NormalizeFrame(get_namespace());
+  parent_frame_id_ = lx_camera::NormalizeFrame(declare_parameter<std::string>(
+      "parent_frame_id", ns.empty() ? "fcu" : ns + "/fcu"));
+  if (publish_mount_tf_ && (parent_frame_id_.empty() ||
+      parent_frame_id_ == frames_->prefix ||
+      parent_frame_id_.compare(0, frames_->prefix.size() + 1, frames_->prefix + "/") == 0)) {
+    throw std::invalid_argument("parent_frame_id must be outside the camera frame tree");
+  }
+  // Pose of the SDK's native IMU axes in camera link coordinates. No optical
+  // rotation is assumed: the installed SDK does not document IMU extrinsic axes.
+  imu_pose_ = declare_parameter<std::vector<double>>("imu_pose", std::vector<double>{});
+  if (!imu_pose_.empty()) lx_camera::PoseFromXyzRpy(imu_pose_);
+}
+
+void LxCamera::PublishStaticTransforms() {
+  if (!publish_tf_) return;
+  std::vector<geometry_msgs::msg::TransformStamped> transforms;
+  const auto stamp = now();
+  auto append = [&](const std::string &parent, const std::string &child,
+                    const Eigen::Isometry3d &pose) {
+    geometry_msgs::msg::TransformStamped message;
+    message.header.stamp = stamp;
+    message.header.frame_id = parent;
+    message.child_frame_id = child;
+    message.transform.translation.x = pose.translation().x();
+    message.transform.translation.y = pose.translation().y();
+    message.transform.translation.z = pose.translation().z();
+    const Eigen::Quaterniond rotation(pose.linear());
+    const auto normalized = rotation.normalized();
+    message.transform.rotation.x = normalized.x();
+    message.transform.rotation.y = normalized.y();
+    message.transform.rotation.z = normalized.z();
+    message.transform.rotation.w = normalized.w();
+    transforms.push_back(message);
+  };
+
+  if (publish_mount_tf_) {
+    append(parent_frame_id_, frames_->link, lx_camera::PoseFromXyzRpy(
+        {install_x_, install_y_, install_z_, install_roll_, install_pitch_, install_yaw_}));
+  }
+  // The camera link origin is the physical depth sensor origin, with body axes.
+  // Keep the depth reference even in RGB-only operation.
+  append(frames_->link, frames_->depth, Eigen::Isometry3d::Identity());
+  append(frames_->depth, frames_->depth_optical, lx_camera::OpticalToBody());
+  if (is_rgb_ || lx_rgbd_align == 1 || lx_rgbd_align == 3) {
+    float *extrinsics = nullptr;
+    const auto result = DcGetPtrValue(handle_, LX_PTR_3D_EXTRIC_PARAM,
+                                     reinterpret_cast<void **>(&extrinsics));
+    try {
+      if (result != LX_SUCCESS) throw std::runtime_error("SDK extrinsics query failed");
+      append(frames_->link, frames_->color, lx_camera::ColorPoseInDepth(extrinsics));
+      append(frames_->color, frames_->color_optical, lx_camera::OpticalToBody());
+    } catch (const std::exception &error) {
+      RCLCPP_ERROR(get_logger(), "Color TF unavailable: %s. No identity fallback is published.",
+                   error.what());
+    }
+  }
+
+  bool imu_enabled = false;
+  if (DcGetBoolValue(handle_, LX_BOOL_ENABLE_IMU, &imu_enabled) == LX_SUCCESS && imu_enabled) {
+    if (!imu_pose_.empty()) {
+      append(frames_->link, frames_->imu, lx_camera::PoseFromXyzRpy(imu_pose_));
+    } else {
+      RCLCPP_WARN(get_logger(),
+          "IMU messages use %s in native SDK axes. Set calibrated imu_pose or provide external TF; "
+          "SDK IMU extrinsic direction is undocumented, so no IMU TF is assumed.", frames_->imu.c_str());
+    }
+  }
+  // Replace the retained sample when streams restart with different settings.
+  static_tf_broadcaster_ = std::make_shared<tf2_ros::StaticTransformBroadcaster>(this);
+  static_tf_broadcaster_->sendTransform(transforms);
+  RCLCPP_INFO(get_logger(), "Published %zu static transforms under %s",
+              transforms.size(), frames_->link.c_str());
 }

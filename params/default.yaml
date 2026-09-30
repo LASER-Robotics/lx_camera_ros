@@ -1,0 +1,317 @@
+# Configuration for lx_camera_node, used by lx_camera_ros.launch.py.
+# Sources: src/lx_camera/lx_camera.cpp and the installed SDK headers:
+# /opt/MRDVS/include/lx_camera_define.h and lx_camera_api.h (SDK 2.4.70).
+# The options below cover all custom parameters read by the current driver.
+# Supported features and ranges depend on the camera model, firmware, and SDK.
+#
+# HOW TO USE
+# - Active entries preserve this file's previous configuration.
+# - Remove the first "# " from a commented entry to configure it.
+# - Commented examples are not the camera's factory defaults.
+# - All LX_INT_* and LX_BOOL_* entries below are INTEGER ROS parameters.
+#   For LX_BOOL_*, use 0/1, never false/true.
+# - Omitting an LX_* entry below or setting it to -1 prevents the driver from
+#   sending that option to the SDK, preserving the current device/SDK behavior.
+#   This does not restore factory defaults. The driver only applies values >= 0.
+# - Hardware settings are read at startup; changing a parameter with
+#   ros2 param set does not automatically reapply the option through the SDK.
+# - /** allows this YAML to match any node name/namespace.
+/**:
+  ros__parameters:
+    # -------------------------------------------------------------------------
+    # ROS clock and launch arguments
+    # -------------------------------------------------------------------------
+    # ROS boolean: true uses /clock; false uses the system clock.
+    # The launch file applies its use_sim_time argument AFTER this YAML, so
+    # the argument takes precedence. It defaults to true only if REAL_UAV=false.
+    # This does not convert timestamps received directly from the sensor/SDK.
+    # use_sim_time: false
+
+    # uav_name, camera_name, camera_params_file, enable_rviz, and rviz_frame are launch
+    # arguments, not parameters of this driver. Command-line example:
+    # uav_name:=uav1 camera_name:=rgbd use_sim_time:=false enable_rviz:=true
+    # uav_name uses UAV_NAME or 'uav1'; camera_name defaults to 'rgbd'.
+    # The YAML supports launch substitutions, for example in log_path:
+    # './log/$(var uav_name)/$(var camera_name)/'
+
+    # -------------------------------------------------------------------------
+    # Static transforms and frame names
+    # -------------------------------------------------------------------------
+    # ROS boolean: publish the camera's fixed transforms on /tf_static.
+    # false disables all TF publication from this driver, including mounting TF.
+    # Frame IDs still identify the data coordinate systems when TF is disabled.
+    publish_tf: true
+
+    # String: camera-local base frame name. The actual node namespace/name form
+    # the prefix, e.g. /uav1/rgbd produces uav1/rgbd/link (no leading slash).
+    # The origin is the depth sensor origin with X forward, Y left, Z up;
+    # it is not a claim about the physical center of the camera housing.
+    # Must differ from depth, depth_optical, color, color_optical, and imu.
+    # If changed, also override the launch argument rviz_frame.
+    base_frame_id: link
+
+    # ROS boolean: also publish parent_frame_id -> camera link using x/y/z and
+    # roll/pitch/yaw below. Keep false when deployment/URDF owns the mounting TF.
+    # Requires publish_tf=true. Internal sensor calibration is independent.
+    publish_mount_tf: false
+
+    # String: full parent frame for the optional mounting TF, without a leading
+    # slash. If omitted, defaults to <node namespace>/fcu, or fcu at root.
+    # parent_frame_id: 'uav1/fcu'
+
+    # Float array: calibrated pose of the native SDK IMU axes in camera link,
+    # [x, y, z, roll, pitch, yaw], in meters and degrees. Only used if IMU is on.
+    # Omitted means no IMU TF: imu messages still use <prefix>/imu and native axes.
+    # Supply an external TF or a measured pose. An all-zero pose is not a known
+    # S11 calibration. The installed SDK does not document the reference/direction
+    # of LX_PTR_IMU_EXTRIC_PARAM, so the driver does not guess its interpretation.
+    # The following syntax example is NOT a measured calibration:
+    # imu_pose: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+    # -------------------------------------------------------------------------
+    # Connection, processing, and logging
+    # -------------------------------------------------------------------------
+    # String: camera IP (e.g., '192.168.1.10') or index such as '0', '1', etc.
+    # '' is converted to '0': opens the first discovered camera.
+    # The driver interprets strings shorter than 8 characters as an index;
+    # other strings are treated as an IP. Serial selection is not supported.
+    # If omitted, the default declared in C++ is '0'.
+    ip: ''
+
+    # Integer: 0 disables; 1 enables GPU acceleration in the SDK library.
+    # Applied before opening the camera; requires platform support.
+    # This profile uses 0; the default declared by the driver is 1 if omitted.
+    enable_gpu: 0
+
+    # Integer: JPEG decoding method for the 2D stream; driver default: 0.
+    # 0 = TurboJPEG; 1 = LxDataProcess;
+    # 2 = Rockchip hardware decoding (loads librockchip_mpp.so);
+    # 3 = LxDataProcess with GPU (equivalent to mode 1 with GPU enabled).
+    # Applies when the 2D transport uses JPEG.
+    # jpeg_decode: 0
+
+    # Integer: SDK log level, not the rclcpp log level.
+    # 0 = info/debug; 1 = warnings/important messages; 2 = errors; 3 = no output.
+    # Driver default: 1. The driver also enables SDK console output.
+    log_level: 1
+
+    # String: SDK log directory, relative to the working directory unless
+    # an absolute path is provided. '' uses the working directory.
+    # This profile uses './log/'; the default declared by the driver is './'.
+    log_path: './log/'
+
+    # -------------------------------------------------------------------------
+    # Streams and ROS publication
+    # -------------------------------------------------------------------------
+    # Integer 0/1: requests the depth stream; driver default: 1.
+    # The 3D stream is enabled if either is_depth OR is_xyz is nonzero.
+    # In the current code, is_xyz=1/2 also causes LxCamera_Depth to be published,
+    # even with is_depth=0. To disable both, use is_depth=0 and is_xyz=0.
+    is_depth: 1
+
+    # Integer: point cloud format published on LxCamera_Cloud; default: 1.
+    # 0 = do not publish a point cloud;
+    # 1 = XYZRGB: uses colors when RGB-D alignment is enabled and RGB data
+    #     with 3 channels is available; otherwise, fills point colors with white;
+    # 2 = XYZ with intensity, timestamp, and row/column position, obtained from
+    #     LX_PTR_XYZIRT_DATA. Requires SDK/device support and the AMP stream.
+    # The published point cloud is unorganized (height=1).
+    is_xyz: 1
+
+    # Integer 0/1: disables/enables the 3D amplitude/intensity stream.
+    # Published on LxCamera_Amp. For is_xyz=2, enable this with 1.
+    LX_BOOL_ENABLE_3D_AMP_STREAM: 0
+
+    # Integer 0/1: disables/enables the 2D image stream.
+    # Published on LxCamera_Rgb; the format depends on the camera/SDK.
+    LX_BOOL_ENABLE_2D_STREAM: 0
+
+    # Integer 0/1: disables/enables the IMU, if available on the device.
+    # The driver receives data through a callback and publishes on LxCamera_Imu.
+    LX_BOOL_ENABLE_IMU: 0
+
+    # -------------------------------------------------------------------------
+    # IMU measurement ranges
+    # -------------------------------------------------------------------------
+    # Integer [0,3]: acceleration range level. Each level doubles the range.
+    # The header does not specify the absolute value in g for each level.
+    # Omitted/-1 preserves the setting; 0 is the lowest level, not "disabled".
+    # LX_INT_IMU_ACCELERATION_LEVEL: 0
+
+    # Integer [0,4]: angular velocity range level; doubles at each level.
+    # The header does not specify the absolute value in degrees/s for each level.
+    # Omitted/-1 preserves the setting; 0 is the lowest level.
+    # LX_INT_IMU_ANGULAR_RANGE_LEVEL: 0
+
+    # -------------------------------------------------------------------------
+    # Point cloud units, axes, and RGB-D alignment
+    # -------------------------------------------------------------------------
+    # Integer: 0 = millimeters; 1 = meters. This profile uses meters.
+    # Affects only XYZ/XYZIRT data returned by the SDK. The driver reads the
+    # effective unit and converts millimeters to meters for ROS PointCloud2.
+    # Does not change the depth image units/format, MIN/MAX_DEPTH limits,
+    # or TF translations.
+    LX_INT_XYZ_UNIT: 1
+
+    # Integer: 0 = camera coordinates (X right, Y down, Z forward);
+    # 1 = robot coordinates (X forward, Y left, Z up).
+    # Affects only XYZ/XYZIRT in the SDK. At stream startup the driver reads
+    # the effective value: 0 selects an optical cloud frame; 1 selects a body
+    # cloud frame. Alignment selects the depth or color origin. Image frames
+    # remain optical. Unknown axes/units prevent streaming rather than mislabel data.
+    # LX_INT_XYZ_COORDINATE: 0
+
+    # Integer: alignment between depth and RGB images.
+    # 0 = disabled; each image keeps its own resolution and coordinates;
+    # 1 = depth to RGB, using RGB resolution/coordinates and enforcing
+    #     RGB undistortion;
+    # 2 = RGB to depth, using depth resolution/coordinates;
+    # 3 = sparse depth to RGB, optimized for processing while preserving
+    #     the number of valid point cloud points.
+    # Availability depends on the camera/SDK. The driver uses this mode to
+    # decide whether to copy RGB colors into the cloud when is_xyz=1.
+    # LX_INT_RGBD_ALIGN_MODE: 1
+
+    # -------------------------------------------------------------------------
+    # Built-in algorithms, operating mode, and frame rate
+    # -------------------------------------------------------------------------
+    # Integer: built-in algorithm, available only on some models.
+    # 0 = disabled; 1 = obstacle detection/avoidance;
+    # 2 = pallet localization/docking; 3 = visual localization;
+    # 4 = obstacle avoidance V2; 5 = custom data from the algorithm platform.
+    # These modes come from the SDK; selecting one does not guarantee that
+    # this node publishes every possible result (the package also provides
+    # lx_localization_node).
+    # The SDK does not allow built-in algorithms when processing is moved
+    # to the host via LX_INT_CALCULATE_UP (not exposed through this YAML).
+    # LX_INT_ALGORITHM_MODE: 0
+
+    # Integer: 0 = maintain heartbeat; the camera enters standby when the SDK
+    # heartbeat stops. 1 = keep the camera running continuously; some settings
+    # cannot be changed in this mode.
+    # LX_INT_WORK_MODE: 0
+
+    # Integer: requested device frame rate for depth and AMP, in frames/s.
+    # The supported range depends on the model and configuration.
+    # The current ROS loop uses rclcpp::Rate(20); increasing this value does
+    # not guarantee publication above 20 Hz. Does not set the IMU or RGB rate.
+    # LX_INT_3D_FPS: 20
+
+    # -------------------------------------------------------------------------
+    # 2D image undistortion and binning
+    # -------------------------------------------------------------------------
+    # Integer 0/1: disables/enables 2D image undistortion.
+    # DEPTH_TO_RGB alignment also enforces RGB undistortion in the SDK.
+    # LX_BOOL_ENABLE_2D_UNDISTORT: 1
+
+    # Integer [0,100]: 2D undistortion scale.
+    # According to the header: 0 preserves the original intrinsics; 1 removes
+    # black borders; larger values preserve more of the field of view.
+    # Applies when undistortion is enabled.
+    # LX_INT_2D_UNDISTORT_SCALE: 1
+
+    # Integer: 2D binning. 0 = 1x1; 1 = 2x2; 2 = 4x4.
+    # Groups pixels and changes resolution, depending on device support.
+    # LX_INT_2D_BINNING_MODE: 1
+
+    # -------------------------------------------------------------------------
+    # 3D image undistortion and binning
+    # -------------------------------------------------------------------------
+    # Integer 0/1: disables/enables 3D image undistortion.
+    # LX_BOOL_ENABLE_3D_UNDISTORT: 1
+
+    # Integer [0,100]: 3D undistortion scale.
+    # According to the header: 0 preserves the original intrinsics; 1 removes
+    # black borders; larger values preserve more of the field of view.
+    # Applies when undistortion is enabled.
+    # LX_INT_3D_UNDISTORT_SCALE: 1
+
+    # Integer: 3D binning. 0 = 1x1; 1 = 2x2; 2 = 4x4.
+    # Groups pixels and changes resolution, depending on device support.
+    # LX_INT_3D_BINNING_MODE: 1
+
+    # -------------------------------------------------------------------------
+    # Interference, HDR, exposure, and depth limits
+    # -------------------------------------------------------------------------
+    # Integer 0/1: ToF multi-camera mode. When enabled, detects and mitigates
+    # interference between cameras. Does not configure ROS namespaces or sync.
+    # LX_BOOL_ENABLE_MULTI_MACHINE: 0
+
+    # Integer 0/1: multi-exposure HDR, if supported by the device.
+    # Extends dynamic range by combining different exposures/integrations.
+    # LX_BOOL_ENABLE_MULTI_EXPOSURE_HDR: 1
+
+    # Integer: first 3D integration/exposure time in microseconds.
+    # Corresponds to the high-integration exposure; example: 1000 us = 1 ms.
+    # The supported range and write availability depend on the camera mode.
+    # LX_INT_FIRST_EXPOSURE: 1000
+
+    # Integer: second 3D integration/exposure time in microseconds.
+    # Corresponds to the low-integration exposure in multi-integration capture.
+    # The supported range and write availability depend on the camera mode.
+    # LX_INT_SECOND_EXPOSURE: 50
+
+    # Integer: device minimum depth limit.
+    # The installed header specifies neither the unit nor a universal range;
+    # confirm these on the device. LX_INT_XYZ_UNIT does not control this unit.
+    # LX_INT_MIN_DEPTH: 0
+
+    # Integer: device maximum depth limit.
+    # The same unit/range caveat as MIN_DEPTH applies here.
+    # 8000 is the example from the package launch files, not a universal maximum.
+    # LX_INT_MAX_DEPTH: 8000
+
+    # -------------------------------------------------------------------------
+    # Installation pose: optional TF parent_frame_id -> camera link
+    # -------------------------------------------------------------------------
+    # ROS floating-point values: use 0.0, not 0. Driver defaults: 0.0.
+    # Translations are copied directly into TF (meters by ROS convention).
+    # Used only when publish_tf=true and publish_mount_tf=true.
+    # Angles are in DEGREES: the driver converts them to radians and composes
+    # Rz(yaw) * Ry(pitch) * Rx(roll). This does not transform cloud coordinates;
+    # it publishes the pose so consumers can apply the transformation.
+
+    # Translation along the X axis of parent_frame_id, in meters.
+    x: 0.0
+
+    # Translation along the Y axis of parent_frame_id, in meters.
+    y: 0.0
+
+    # Translation along the Z axis of parent_frame_id, in meters.
+    z: 0.0
+
+    # Roll rotation around X, in degrees.
+    roll: 0.0
+
+    # Pitch rotation around Y, in degrees.
+    pitch: 0.0
+
+    # Yaw rotation around Z, in degrees.
+    yaw: 0.0
+
+    # -------------------------------------------------------------------------
+    # Limits of YAML configuration in this driver
+    # -------------------------------------------------------------------------
+    # LX_BOOL_ENABLE_3D_DEPTH_STREAM is derived from is_depth/is_xyz;
+    # it is not a directly configurable ROS parameter.
+    # The legacy names is_amp, is_rgb, raw_param, and lx_* in other launch files
+    # in this package are not read by the current lx_camera_node.
+    # Use LX_BOOL_ENABLE_3D_AMP_STREAM / LX_BOOL_ENABLE_2D_STREAM for the streams;
+    # LX_INT_WORK_MODE / LX_INT_ALGORITHM_MODE / LX_INT_XYZ_UNIT replace
+    # lx_work_mode / lx_application / lx_tof_unit, respectively.
+    #
+    # The SDK provides other features (2D/3D auto exposure, gain, ROI, frame
+    # synchronization, filters, triggering, PTP, etc.) that this driver does not
+    # declare as parameters. Adding their names to the YAML does not apply them.
+    # Some can be accessed through LxCamera_LxInt, LxCamera_LxBool,
+    # LxCamera_LxFloat, LxCamera_LxString, or LxCamera_LxCmd services, depending
+    # on the API; others require driver changes. IDs are in LX_CAMERA_FEATURE.
+    # LxCamera_LxInt with is_set=false queries cur_value, min_value, max_value,
+    # and available. Also check result.ret/result.msg in the response.
+    #
+    # Topic names are relative to the uav_name namespace. Frame IDs use the
+    # actual node namespace/name, so camera_name also identifies the TF subtree.
+    # The driver publishes no dynamic TF and no legacy LxCamera_TF topic.
+    # Application algorithm results retain their SDK coordinates in the separate
+    # <prefix>/application frame, without an assumed TF to the depth sensor.
+    # These algorithm outputs require their own coordinate/calibration contract.

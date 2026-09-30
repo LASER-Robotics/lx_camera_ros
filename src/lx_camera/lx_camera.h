@@ -2,6 +2,7 @@
 #define _LX_CAMERAM_ROS_H_
 
 #include "utils/dynamic_link.h"
+#include "lx_camera/frame_geometry.h"
 #include <pcl/common/common_headers.h>
 
 #include "geometry_msgs/msg/pose_stamped.hpp"
@@ -13,7 +14,7 @@
 #include "sensor_msgs/msg/point_cloud2.hpp"
 #include "std_msgs/msg/bool.hpp"
 #include "std_msgs/msg/string.hpp"
-#include "tf2_ros/transform_broadcaster.h"
+#include "tf2_ros/static_transform_broadcaster.h"
 
 #include "lx_camera_ros/msg/frame_rate.hpp"
 #include "lx_camera_ros/msg/obstacle.hpp"
@@ -73,7 +74,8 @@ typedef PointXYZIT PointType;
 
 class LxCamera : public rclcpp::Node {
 public:
-  explicit LxCamera(DcLib *dynamic_lib);
+  explicit LxCamera(DcLib *dynamic_lib,
+                    const rclcpp::NodeOptions &options = rclcpp::NodeOptions());
   ~LxCamera();
   bool SearchAndOpenDevice();
   int Start();
@@ -92,15 +94,18 @@ private:
              const lx_camera_ros::srv::LxCmd::Response::SharedPtr res);
   bool LxInt(const lx_camera_ros::srv::LxInt::Request::SharedPtr req,
              const lx_camera_ros::srv::LxInt::Response::SharedPtr res);
-  void PubTf(const geometry_msgs::msg::TransformStamped &transform_stamped);
+  void ConfigureFrames();
+  void PublishStaticTransforms();
+  static void ImuDataCallback(LxImuData *data, void *user_data);
 
 private:
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr pub_error_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_rgb_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_depth_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_amp_;
-  rclcpp::Publisher<geometry_msgs::msg::TransformStamped>::SharedPtr pub_tf_;
+  rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr pub_imu_;
   rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr pub_tof_info_;
+  rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr pub_amp_info_;
   rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr pub_rgb_info_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_cloud_;
   //rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_lidarCloud_;
@@ -109,11 +114,20 @@ private:
   rclcpp::Publisher<lx_camera_ros::msg::Obstacle>::SharedPtr pub_obstacle_;
   rclcpp::Publisher<lx_camera_ros::msg::Pallet>::SharedPtr pub_pallet_;
 
-  geometry_msgs::msg::TransformStamped tf_;
+  std::unique_ptr<lx_camera::FrameNames> frames_;
+  std::shared_ptr<tf2_ros::StaticTransformBroadcaster> static_tf_broadcaster_;
+  std::vector<rclcpp::ServiceBase::SharedPtr> services_;
+  bool publish_tf_ = true;
+  bool publish_mount_tf_ = false;
+  std::string parent_frame_id_;
+  std::vector<double> imu_pose_;
+  std::string depth_image_frame_, color_image_frame_, cloud_frame_;
+  double cloud_unit_scale_ = 1.0;
   sensor_msgs::msg::CameraInfo tof_info_;
   sensor_msgs::msg::CameraInfo rgb_info_;
 
-  DcHandle handle_;
+  DcHandle handle_ = 0;
+  bool device_open_ = false;
   bool is_start_ = 0;
 
   rmw_qos_profile_t qos_;

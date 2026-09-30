@@ -107,8 +107,22 @@ install(TARGETS ${TARGET_NAME} EXPORT export_${PROJECT_NAME} DESTINATION lib/${P
 
 
 install(DIRECTORY
-launch rviz
+launch rviz params
 DESTINATION share/${PROJECT_NAME}/
 )
+
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  find_package(Eigen3 REQUIRED)
+  ament_add_gtest(test_frame_geometry test/test_frame_geometry.cpp)
+  target_include_directories(test_frame_geometry PRIVATE src)
+  target_link_libraries(test_frame_geometry Eigen3::Eigen)
+  ament_add_gtest(test_driver_frames test/test_driver_frames.cpp
+    src/lx_camera/lx_camera.cpp src/utils/dynamic_link.cpp TIMEOUT 60)
+  ament_target_dependencies(test_driver_frames ${dependencies} rosidl_default_runtime)
+  target_link_libraries(test_driver_frames ${PCL_LIBRARIES} "${cpp_typesupport_target}")
+  set_tests_properties(test_driver_frames PROPERTIES
+    ENVIRONMENT "ROS_LOG_DIR=${CMAKE_CURRENT_BINARY_DIR}/test_ros_logs;ROS_DOMAIN_ID=173;ROS_LOCALHOST_ONLY=1")
+endif()
 
 ament_package()

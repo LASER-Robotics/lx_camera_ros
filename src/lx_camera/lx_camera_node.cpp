@@ -8,8 +8,9 @@ int main(int argc, char **argv)
 	}
     rclcpp::init(argc, argv);
 	auto node = std::make_shared<LxCamera>(&lib);
-	rclcpp::spin(node);
+	node->Run();
+	node.reset();
 	DisDynamicLink(&lib);
+	rclcpp::shutdown();
 	return 0;
 }
-
